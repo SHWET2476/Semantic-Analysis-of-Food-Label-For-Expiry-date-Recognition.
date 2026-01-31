@@ -1,0 +1,185 @@
+import torch
+from transformers import BertTokenizerFast, BertForTokenClassification, pipeline
+import re
+import cv2
+import matplotlib.pyplot as plt
+import os
+import glob
+import json
+import argparse
+import easyocr
+from dateutil import parser
+from datetime import datetime
+
+# BERT_MODEL_LOADING
+tokenizer = BertTokenizerFast.from_pretrained("dslim/bert-base-NER")
+model = BertForTokenClassification.from_pretrained("dslim/bert-base-NER")
+ner_pipeline = pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
+
+# DATE REGEX PATTERNS
+DATE_PATTERNS = [
+    r"\b\d{4}[-/.]\d{2}[-/.]\d{2}\b",
+    r"\b\d{2}[-/.]\d{2}[-/.]\d{4}\b",
+    r"\b\d{2}[-/.]\d{2}[-/.]\d{2}\b",
+    r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b",
+    r"\b[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}\b",
+    r"\b[A-Za-z]{3,9}\s+\d{1,2},\s+\d{2}\b",
+    r"\b\d{1,2}-[A-Za-z]{3,9}-\d{2,4}\b",
+    r"\b\d{1,2}/[A-Za-z]{3,9}/\d{2,4}\b",
+    r"\b\d{1,2}[A-Za-z]{3,9}\d{2,4}\b",
+    r"^(?:(0[1-9]|[12][0-9]|3[01])[-/.](0[1-9]|1[012])[-/.](19|20)\d\d)$",
+    r"^(?:(0[1-9]|[12][0-9]|3[01])(0[1-9]|1[012])(19|20)\d\d)$"
+]
+
+def normalize_date(date_str):
+    try:
+        parsed_date = parser.parse(date_str, dayfirst=True, fuzzy=True)
+        return parsed_date.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def extract_text_from_image(image_path):
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"[ERROR] Image path does not exist: {image_path}")
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"[ERROR] Could not read image at: {image_path}")
+    reader = easyocr.Reader(['en'], gpu=False)
+    result = reader.readtext(image_path, detail=0)
+    extracted_text = " ".join(result)
+    return image, extracted_text
+
+def detect_dates_with_bert(text):
+    try:
+        ner_results = ner_pipeline(text)
+        dates = [entity['word'] for entity in ner_results if entity['entity_group'] == 'DATE']
+        return dates
+    except Exception as e:
+        print(f"[ERROR] Error during BERT date detection: {e}")
+        return []
+
+def filter_valid_dates(dates):
+    valid_dates = []
+    for date_str in dates:
+        for pattern in DATE_PATTERNS:
+            if re.search(pattern, date_str):
+                valid_dates.append(date_str)
+                break
+    return valid_dates
+
+def annotate_image(image, detected_dates, expected_expiry_dates, expected_manufacturing_dates):
+    annotated = image.copy()
+    y_offset = 30
+    if detected_dates:
+        text = f"Detected Dates: {', '.join(detected_dates)}"
+        cv2.putText(annotated, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        y_offset += 30
+    if expected_expiry_dates:
+        text = f"Expected Expiry: {', '.join(expected_expiry_dates)}"
+        cv2.putText(annotated, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        y_offset += 30
+    if expected_manufacturing_dates:
+        text = f"Expected Manufacturing: {', '.join(expected_manufacturing_dates)}"
+        cv2.putText(annotated, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    return annotated
+
+def show_image(image, title="Annotated Image"):
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    plt.imshow(image_rgb)
+    plt.title(title)
+    plt.axis("off")
+    plt.show()
+
+def load_annotations(json_files):
+    all_annotations = {}
+    for json_file in json_files:
+        try:
+            with open(json_file, 'r') as f:
+                annotations = json.load(f)
+                all_annotations.update(annotations)
+        except Exception as e:
+            print(f"[ERROR] Failed to load annotations from {json_file}: {e}")
+    return all_annotations
+
+def process_image(image_path, annotations_data):
+    print(f"[INFO] Processing image: {image_path}")
+    image, extracted_text = extract_text_from_image(image_path)
+    print(f"[INFO] Extracted Text: {extracted_text}")
+    predicted_dates_raw = detect_dates_with_bert(extracted_text)
+    predicted_dates = filter_valid_dates(predicted_dates_raw)
+    print(f"[INFO] Detected Dates: {predicted_dates}")
+    
+    image_name = os.path.basename(image_path)
+    expected_expiry_dates = []
+    expected_manufacturing_dates = []
+
+    if image_name in annotations_data:
+        for annotation in annotations_data[image_name]['ann']:
+            if annotation['type'] == 'expiry':
+                expected_expiry_dates.append(annotation['transcription'])
+            elif annotation['type'] == 'manufacturing':
+                expected_manufacturing_dates.append(annotation['transcription'])
+
+    print(f"[INFO] Expected Expiry Dates: {expected_expiry_dates}")
+    print(f"[INFO] Expected Manufacturing Dates: {expected_manufacturing_dates}")
+
+    normalized_predicted = list(filter(None, [normalize_date(d) for d in predicted_dates]))
+    normalized_expiry = list(filter(None, [normalize_date(d) for d in expected_expiry_dates]))
+    normalized_manufacturing = list(filter(None, [normalize_date(d) for d in expected_manufacturing_dates]))
+
+    expiry_accuracy = (
+        sum(1 for expected in normalized_expiry if expected in normalized_predicted) / len(normalized_expiry)
+        if normalized_expiry else 0.0
+    )
+
+    manufacturing_accuracy = (
+        sum(1 for expected in normalized_manufacturing if expected in normalized_predicted) / len(normalized_manufacturing)
+        if normalized_manufacturing else 0.0
+    )
+
+    print(f"[INFO] Expiry Accuracy: {expiry_accuracy:.2f}")
+    print(f"[INFO] Manufacturing Accuracy: {manufacturing_accuracy:.2f}")
+
+    annotated_image = annotate_image(image, predicted_dates, expected_expiry_dates, expected_manufacturing_dates)
+    return annotated_image, expiry_accuracy, manufacturing_accuracy, extracted_text
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Detect expiry and manufacturing dates in images.")
+    parser.add_argument("image_path", type=str, help="Path to the image file or directory.")
+    parser.add_argument("json_dir", type=str, help="Path to the directory containing the JSON annotation files.")
+    args = parser.parse_args()
+
+    json_files = glob.glob(os.path.join(args.json_dir, "*.json"))
+    if not json_files:
+        print(f"[ERROR] No JSON files found in the specified directory: {args.json_dir}")
+        exit(1)
+
+    annotations_data = load_annotations(json_files)
+    if not annotations_data:
+        print("[ERROR] No annotation data loaded from any JSON file. Exiting.")
+        exit(1)
+
+    image_path = args.image_path
+    if os.path.isdir(image_path):
+        image_files = [os.path.join(image_path, f) for f in os.listdir(image_path)
+                       if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        total_expiry_accuracy = 0
+        total_manufacturing_accuracy = 0
+        num_images = 0
+
+        for img_file in image_files:
+            annotated_image, expiry_accuracy, manufacturing_accuracy, extracted_text = process_image(img_file, annotations_data)
+            if annotated_image is not None:
+                show_image(annotated_image, title=f"{os.path.basename(img_file)} | Expiry: {expiry_accuracy:.2f}, MFG: {manufacturing_accuracy:.2f}")
+                total_expiry_accuracy += expiry_accuracy
+                total_manufacturing_accuracy += manufacturing_accuracy
+                num_images += 1
+        if num_images > 0:
+            print(f"[INFO] Average Expiry Accuracy: {total_expiry_accuracy / num_images:.2f}")
+            print(f"[INFO] Average Manufacturing Accuracy: {total_manufacturing_accuracy / num_images:.2f}")
+        else:
+            print("[INFO] No images processed.")
+    else:
+        annotated_image, expiry_accuracy, manufacturing_accuracy, extracted_text = process_image(image_path, annotations_data)
+        if annotated_image is not None:
+            show_image(annotated_image, title=f"{os.path.basename(image_path)} | Expiry: {expiry_accuracy:.2f}, MFG: {manufacturing_accuracy:.2f}")

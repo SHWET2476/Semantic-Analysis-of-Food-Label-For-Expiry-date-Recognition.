@@ -1,0 +1,13 @@
+torch
+torchvision
+torchaudio
+transformers
+opencv-python
+matplotlib
+pillow
+numpy
+pytesseract
+easyocr
+scikit-learn
+pandas
+paddleocr
